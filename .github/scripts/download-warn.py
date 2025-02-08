@@ -4,6 +4,7 @@ import os
 from datetime import datetime
 import json
 import sys
+import re
 from pathlib import Path
 
 def get_california_warn_url():
@@ -48,6 +49,31 @@ def download_file(url, download_dir):
     
     return output_path
 
+def standardize_column_name(col_name):
+    """
+    Standardize column names:
+    1. Convert to lowercase
+    2. Remove special characters
+    3. Replace whitespace with underscore
+    4. Remove any remaining invalid characters
+    """
+    # Convert to string and lowercase
+    col_name = str(col_name).lower()
+    
+    # Replace common special characters and whitespace with underscore
+    col_name = re.sub(r'[-./\s]+', '_', col_name)
+    
+    # Remove any other special characters
+    col_name = re.sub(r'[^a-z0-9_]', '', col_name)
+    
+    # Remove leading/trailing underscores
+    col_name = col_name.strip('_')
+    
+    # Replace multiple underscores with single underscore
+    col_name = re.sub(r'_+', '_', col_name)
+    
+    return col_name
+
 def process_california_warn(file_path):
     """
     Process California WARN Excel file:
@@ -61,6 +87,9 @@ def process_california_warn(file_path):
         header=1  # Use second row as headers
     )
     
+    # Standardize column names
+    df.columns = [standardize_column_name(col) for col in df.columns]
+
     # Add state and download timestamp
     df['state'] = 'california'
     df['download_date'] = datetime.now().isoformat()
