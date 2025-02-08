@@ -1,5 +1,11 @@
 name: Download WARN Data and Update Dashboard
 on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  release:
+    types: [published]
   schedule:
     - cron: '0 0 * * *' # Runs daily at midnight UTC
   workflow_dispatch: {} # Allows manual triggering
@@ -58,7 +64,10 @@ jobs:
         uses: quarto-dev/quarto-actions/setup@v2
         with:
           version: pre-release
-            
+      
+      - name: Directory listing
+        run: ls -R .
+
       - name: Render Quarto Project
         run: |
           quarto render

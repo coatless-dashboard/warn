@@ -24,7 +24,7 @@ from great_tables import GT, style, loc
 
 # Get current year for data loading
 CURRENT_YEAR = datetime.now().year
-DATA_FILE = f"warn-data/processed/ca/{CURRENT_YEAR}/ca-{CURRENT_YEAR}-warn-notice.parquet"
+DATA_FILE = f"warn-data/data/processed/ca/{CURRENT_YEAR}/ca-{CURRENT_YEAR}-warn-notice.parquet"
 ```
 
 # Overview {orientation="rows"}
