@@ -1,1 +1,3 @@
 warn-data/*
+_site/*
+/.quarto/

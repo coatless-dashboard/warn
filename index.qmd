@@ -1,0 +1,573 @@
+---
+title: "California WARN Notice"
+format:
+  dashboard:
+    theme: cosmo
+    orientation: columns
+    scrolling: false
+execute:
+  warning: false
+---
+
+```{python}
+#| label: setup
+#| message: false
+
+import polars as pl
+import pandas as pd # plotly woes...
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import seaborn as sns
+import matplotlib.pyplot as plt
+from datetime import datetime
+import numpy as np
+from great_tables import GT, style, loc
+
+# Get current year for data loading
+CURRENT_YEAR = datetime.now().year
+DATA_FILE = f"warn-data/processed/ca/{CURRENT_YEAR}/ca-{CURRENT_YEAR}-warn-notice.parquet"
+```
+
+# Overview {orientation="rows"}
+
+## Row
+
+```{python}
+#| label: load-data-and-summary
+
+# Load the parquet file and calculate notice period
+df = pl.read_parquet(DATA_FILE)
+df = df.with_columns([
+    (pl.col("effective_date").cast(pl.Date) - pl.col("notice_date").cast(pl.Date))
+    .dt.days()
+    .alias("notice_period_days")
+])
+```
+
+```{python}
+#| label: monthly-trends
+#| title: "Monthly Affected Employees"
+#| fig-height: 8
+
+def plot_category_breakdown(df):
+    # Create monthly aggregations by category using Polars
+    monthly_by_category = (
+        df.select(
+            pl.col("notice_date").cast(pl.Date).dt.truncate("1mo").alias("month"),
+            "layoff_closure",
+            "no_of_employees"
+        )
+        .groupby(["month", "layoff_closure"])
+        .agg(
+            pl.col("no_of_employees").sum().alias("total_employees")
+        )
+        .sort("month")
+        .to_pandas()
+    )
+    
+    # Create monthly totals using Polars
+    monthly_totals = (
+        df.select(
+            pl.col("notice_date").cast(pl.Date).dt.truncate("1mo").alias("month"),
+            "no_of_employees"
+        )
+        .groupby("month")
+        .agg(
+            pl.col("no_of_employees").sum().alias("total_employees")
+        )
+        .sort("month")
+        .to_pandas()
+    )
+    
+    # Format dates for x-axis
+    x_labels = monthly_totals['month'].dt.strftime('%b %Y')
+    
+    # Create pivot table for category data
+    pivot_data = monthly_by_category.pivot(index='month', 
+                                         columns='layoff_closure', 
+                                         values='total_employees').fillna(0)
+    
+    # Create figure with secondary y-axis
+    fig = go.Figure()
+    
+    # Colors for categories
+    colors = [
+        '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', 
+        '#9467bd', '#8c564b', '#e377c2', '#7f7f7f'
+    ]
+    
+    # Add stacked bars for each category first
+    for idx, category in enumerate(pivot_data.columns):
+        fig.add_trace(
+            go.Bar(
+                x=x_labels,
+                y=pivot_data[category],
+                name=category,
+                marker_color=colors[idx % len(colors)],
+                width=0.6
+            )
+        )
+    
+    # Add total employees bar (wide and semi-transparent) in a separate trace
+    fig.add_trace(
+        go.Bar(
+            x=x_labels,
+            y=monthly_totals['total_employees'],
+            name='Total Affected',
+            marker=dict(
+                color='rgb(158, 158, 158)',
+                opacity=0.3
+            ),
+            width=0.8,
+            offset=-0.4,  # Center the wider bars
+            hovertemplate='Total Affected: %{y:,.0f}<extra></extra>',
+            yaxis='y2'  # Use secondary y-axis
+        )
+    )
+    
+    # Update layout
+    fig.update_layout(
+        title='Monthly Affected Employees by Category',
+        xaxis_title='Month',
+        yaxis_title='Number of Affected Employees',
+        barmode='stack',
+        showlegend=True,
+        legend=dict(
+            yanchor="top",
+            y=0.99,
+            xanchor="left",
+            x=1.05
+        ),
+        margin=dict(r=200),  # Add right margin for legend
+        height=600,
+        xaxis=dict(
+            tickangle=45,
+            tickmode='array',
+            ticktext=x_labels,
+            tickvals=x_labels
+        ),
+        yaxis=dict(
+            tickformat=',d',  # Format y-axis with commas
+            title='Number of Affected Employees'
+        ),
+        yaxis2=dict(
+            tickformat=',d',
+            overlaying='y',
+            matches='y',
+            showgrid=False,
+            showticklabels=False,
+            title=None
+        )
+    )
+    
+    return fig
+
+plot_category_breakdown(df)
+```
+
+```{python}
+#| label: summary-stats
+#| title: "Summary Statistics"
+# Calculate summary statistics
+def calculate_summary_stats(data, filter_days=None):
+    base_data = data
+    if filter_days is not None:
+        base_data = data.filter(pl.col("notice_period_days") <= filter_days)
+    
+    summary = {
+        "total_notices": len(base_data),
+        "total_affected": base_data["no_of_employees"].sum(),
+        "permanent_layoff": base_data.filter(pl.col("layoff_closure") == "Layoff Permanent")["no_of_employees"].sum(),
+        "temporary_layoff": base_data.filter(pl.col("layoff_closure") == "Layoff Temporary")["no_of_employees"].sum(),
+        "not_identified_layoff": base_data.filter(pl.col("layoff_closure") == "Not Identified Layoff")["no_of_employees"].sum(),
+        "permanent_closure": base_data.filter(pl.col("layoff_closure") == "Closure Permanent")["no_of_employees"].sum(),
+        "temporary_closure": base_data.filter(pl.col("layoff_closure") == "Temporary Closure")["no_of_employees"].sum(),
+        "not_identified_closure": base_data.filter(pl.col("layoff_closure") == "Closure Not known at this time")["no_of_employees"].sum(),
+    }
+    return summary
+
+def create_summary_table(stats, title):
+    # Create summary DataFrame
+    summary_df = pd.DataFrame([
+        ['Total Notices', stats['total_notices']],
+        ['Total Affected Employees', stats['total_affected']],
+        ['Permanent Layoff', stats['permanent_layoff']],
+        ['Temporary Layoff', stats['temporary_layoff']],
+        ['Not Identified Layoff', stats['not_identified_layoff']],
+        ['Permanent Closure', stats['permanent_closure']],
+        ['Temporary Closure', stats['temporary_closure']],
+        ['Not Identified Closure', stats['not_identified_closure']]
+    ], columns=['Metric', 'Value'])
+    
+    # Create and format GT table
+    gt_table = (GT(summary_df)
+                .tab_header(title=title)
+                .fmt_number(
+                    columns=['Value'],
+                    decimals=0,
+                    use_seps=True
+                ))
+    
+    return gt_table
+
+# Display overall summary table
+overall_table = create_summary_table(calculate_summary_stats(df), "Overall Summary Statistics")
+overall_table.show()
+```
+
+## Row
+
+```{python}
+#| title: Employee Impact Distribution by Notice and Effective Dates
+
+def create_notice_heatmaps_single_scale(df):
+    # Function to aggregate data by month and year
+    def aggregate_by_month_year(date_col):
+        return (
+            df.select(
+                pl.col(date_col).cast(pl.Date).dt.month().alias("month"),
+                pl.col(date_col).cast(pl.Date).dt.year().alias("year"),
+                "no_of_employees"
+            )
+            .groupby(["year", "month"])
+            .agg(
+                pl.col("no_of_employees").sum().alias("total_affected")
+            )
+            .sort(["year", "month"])
+            .to_pandas()
+        )
+
+    # Aggregate data for both dates
+    notice_data = aggregate_by_month_year("notice_date")
+    effective_data = aggregate_by_month_year("effective_date")
+
+    # Create pivot tables for heatmap format
+    notice_pivot = notice_data.pivot(index='year', columns='month', values='total_affected').fillna(0)
+    effective_pivot = effective_data.pivot(index='year', columns='month', values='total_affected').fillna(0)
+
+    # Create month labels
+    month_labels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+                   'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+    # Find global max for consistent color scale
+    global_max = max(notice_pivot.values.max(), effective_pivot.values.max())
+
+    # Create figure with subplots
+    fig = make_subplots(
+        rows=2, cols=1,
+        subplot_titles=('Notice Date Distribution', 'Effective Date Distribution'),
+        vertical_spacing=0.15
+    )
+
+    # Add notice date heatmap
+    fig.add_trace(
+        go.Heatmap(
+            z=notice_pivot.values,
+            x=month_labels,
+            y=notice_pivot.index,
+            colorscale='YlOrRd',
+            text=notice_pivot.values,
+            texttemplate='%{text:,.0f}',
+            textfont={"size": 10},
+            name='Notice Date',
+            zmin=0,
+            zmax=global_max,
+            hoverongaps=False,
+            hovertemplate='Month: %{x}<br>Year: %{y}<br>Affected: %{z:,.0f}<extra></extra>'
+        ),
+        row=1, col=1
+    )
+
+    # Add effective date heatmap
+    fig.add_trace(
+        go.Heatmap(
+            z=effective_pivot.values,
+            x=month_labels,
+            y=effective_pivot.index,
+            colorscale='YlOrRd',
+            text=effective_pivot.values,
+            texttemplate='%{text:,.0f}',
+            textfont={"size": 10},
+            name='Effective Date',
+            zmin=0,
+            zmax=global_max,
+            hoverongaps=False,
+            hovertemplate='Month: %{x}<br>Year: %{y}<br>Affected: %{z:,.0f}<extra></extra>'
+        ),
+        row=2, col=1
+    )
+
+    # Update layout
+    fig.update_layout(
+        height=800,
+        showlegend=False
+    )
+
+    # Update axes labels and properties
+    fig.update_xaxes(title_text="Month", row=1, col=1)
+    fig.update_xaxes(title_text="Month", row=2, col=1)
+    fig.update_yaxes(title_text="Year", row=1, col=1,
+                    tickmode='linear',
+                    tick0=notice_pivot.index.min(),
+                    dtick=1)
+    fig.update_yaxes(title_text="Year", row=2, col=1,
+                    tickmode='linear',
+                    tick0=effective_pivot.index.min(),
+                    dtick=1)
+
+    return fig
+
+create_notice_heatmaps_single_scale(df)
+```
+
+# Analysis {.tabset orientation="rows"}
+
+## Row {height="50%"}
+
+```{python}
+#| label: county-analysis
+#| title: "County Impact Analysis"
+
+def county_impact_treemap(df):
+    county_data = (
+        df.groupby("county_parish")
+        .agg(
+            pl.col("no_of_employees").sum().alias("total_affected"),
+            pl.count().alias("num_notices")
+        )
+        .sort("total_affected", descending=True)
+        .head(15)
+        .to_pandas()
+    )
+    
+    # Remove "County" from the county_parish names
+    county_data['county_parish'] = county_data['county_parish'].str.replace(' County', '')
+
+
+    fig = px.treemap(
+        county_data,
+        path=["county_parish"],
+        values="total_affected",
+        title="Top 15 Counties by Affected Employees"
+    )
+
+    # Customize the text display
+    fig.update_traces(
+        textinfo="label+value",
+        textposition="middle center",
+        hovertemplate="%{label}: %{value:,}<extra></extra>",  # Simplified hover text
+        textfont=dict(size=12),  # Adjust font size for better fit
+        insidetextfont=dict(size=12),  # Ensure consistent font size
+    )
+
+
+    # Improve layout
+    fig.update_layout(
+        margin=dict(t=30, l=10, r=10, b=10),  # Reduce margins
+        uniformtext=dict(minsize=8, mode='show'),  # Ensure text visibility
+    )
+
+    return fig
+
+county_impact_treemap(df)
+```
+
+## Row {height="45%"}
+
+```{python}
+#| label: notice-period-distribution
+#| title: "Notice Period Distribution"
+
+def notice_period_histogram(df):
+    # Create the histogram
+    fig = px.histogram(
+        df.to_pandas(),
+        x="notice_period_days",
+        title="Distribution of Notice Period Length",
+        labels={"notice_period_days": "Days Between Notice and Effective Date",
+                "count": "Number of Notices"},
+        nbins=50
+    )
+
+    # Add the vertical line marker
+    fig.add_vline(
+        x=60, 
+        line_dash="dash", 
+        line_color="red",
+        annotation_text="60-day threshold"
+    )
+
+    # Customize hover template to show day range and formatted count
+    fig.update_traces(
+        hovertemplate="Day Range: %{x}<br>Count: %{y:,}<extra></extra>"
+    )
+
+    return fig
+
+notice_period_histogram(df)
+```
+
+## Row {height="55%"}
+
+```{python}
+#| label: industry-analysis
+#| title: "Industry Impact Analysis"
+
+# Prepare industry data
+industry_data = (
+    df.groupby("related_industry")
+    .agg(
+        pl.col("no_of_employees").sum().alias("total_affected")
+    )
+    .sort("total_affected", descending=True)
+    .to_pandas()
+)
+
+# Calculate percentages for waffle chart
+total = industry_data['total_affected'].sum()
+industry_data['percentage'] = (industry_data['total_affected'] / total * 100).round(1)
+
+# Also create a summary table of industries
+industry_table = (GT(industry_data)
+                 .tab_header(title="Industry Impact Summary")
+                 .cols_label(
+                     related_industry="Industry",
+                     total_affected="Total Affected",
+                     percentage="Percentage"
+                 )
+                 .fmt_number(
+                     columns=['total_affected'],
+                     decimals=0,
+                     use_seps=True
+                 )
+                 .fmt_number(
+                     columns=['percentage'],
+                     decimals=1,
+                     pattern='{x}%',
+                 )
+                 .tab_style(
+                     style=style.text(weight="bold"),
+                     locations=loc.column_labels()
+                 )
+                 .opt_row_striping())
+
+industry_table.show()
+```
+
+```{python}
+#| label: company-analysis
+#| title: "Top Companies"
+
+# Prepare company data
+company_data = (
+    df.group_by("company")
+    .agg(
+        pl.col("no_of_employees").sum().alias("total_affected"),
+        pl.count().alias("num_notices")
+    )
+    .sort("total_affected", descending=True)
+    .head(10)
+    .to_pandas()
+)
+
+# Truncate company names
+company_data['company'] = company_data['company'].str.slice(0, 32)
+
+# Create and format company table
+company_table = (GT(company_data)
+                .tab_header(title="Top 10 Companies by Affected Employees")
+                .cols_label(
+                    company="Company",
+                    total_affected="Total Affected",
+                    num_notices="Number of Notices"
+                )
+                .fmt_number(
+                    columns=['total_affected', 'num_notices'],
+                    decimals=0,
+                    use_seps=True
+                )
+                .tab_style(
+                    style=style.text(weight="bold"),
+                    locations=loc.column_labels()
+                )
+                .opt_row_striping())
+
+company_table.show()
+```
+
+# Data Explorer
+
+```{python}
+#| label: interactive-table
+#| title: "WARN Notices Data Explorer"
+
+from itables import show
+from itables import options
+
+# Configure table options
+options.maxRows = 1000
+options.columnDefs = [{"className": "dt-center", "targets": "_all"}]
+options.dom = 'Bfrtip'
+options.buttons = ['copy', 'csv', 'excel']
+
+# Display interactive table
+show(df.to_pandas(), showIndex=False)
+```
+
+## Row
+
+
+
+# 60 Days {height=50%}
+
+```{python}
+#| label: sixty-day-summary
+#| title: "60-Day Notice Period Statistics"
+
+# Display 60-day summary table
+sixty_day_table = create_summary_table(calculate_summary_stats(df, 60), "60-Day Notice Period Summary Statistics")
+sixty_day_table.show()
+```
+
+
+# About
+
+## Row
+
+This dashboard analyzes [Worker Adjustment and Retraining Notification (WARN) notices](https://www.dol.gov/general/topic/termination/plantclosings) 
+in [California](https://edd.ca.gov/en/jobs_and_training/Layoff_Services_WARN/) for `{python} CURRENT_YEAR`. WARN notices are required when companies 
+plan significant layoffs, providing advance notification to affected workers. The notice includes information on the number of affected employees,
+notice and effective dates, layoff reasons, and company details. The data is being stored in a [separate repository](https://github.com/coatless-data/warn-files) 
+and is updated nightly.
+
+Last updated: **`{python} datetime.now().strftime('%Y-%m-%d %H:%M:%S')`**
+
+```{python}
+#| label: data-quality
+
+# Calculate data quality metrics
+quality_df = pd.DataFrame([
+    ['Total Records', len(df)],
+    ['Date Range Start', df["notice_date"].min()],
+    ['Date Range End', df["notice_date"].max()]
+], columns=['Metric', 'Value'])
+
+# Add missing values
+for col, count in df.null_count().to_dict().items():
+    if count[0] > 0:
+        quality_df = pd.concat([quality_df, pd.DataFrame([
+            [f'Missing {col}', count[0]]
+        ], columns=['Metric', 'Value'])], ignore_index=True)
+
+# Create and format quality metrics table
+quality_table = (GT(quality_df)
+                .tab_header(title="Data Quality Metrics")
+                .tab_style(
+                    style=style.text(weight="bold"),
+                    locations=loc.column_labels()
+                )
+                .opt_row_striping())
+
+quality_table.show()
+```
