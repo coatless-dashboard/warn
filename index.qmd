@@ -56,7 +56,7 @@ def plot_category_breakdown(df):
             "layoff_closure",
             "no_of_employees"
         )
-        .groupby(["month", "layoff_closure"])
+        .group_by(["month", "layoff_closure"])
         .agg(
             pl.col("no_of_employees").sum().alias("total_employees")
         )
@@ -70,7 +70,7 @@ def plot_category_breakdown(df):
             pl.col("notice_date").cast(pl.Date).dt.truncate("1mo").alias("month"),
             "no_of_employees"
         )
-        .groupby("month")
+        .group_by("month")
         .agg(
             pl.col("no_of_employees").sum().alias("total_employees")
         )
@@ -228,7 +228,7 @@ def create_notice_heatmaps_single_scale(df):
                 pl.col(date_col).cast(pl.Date).dt.year().alias("year"),
                 "no_of_employees"
             )
-            .groupby(["year", "month"])
+            .group_by(["year", "month"])
             .agg(
                 pl.col("no_of_employees").sum().alias("total_affected")
             )
@@ -329,7 +329,7 @@ create_notice_heatmaps_single_scale(df)
 
 def county_impact_treemap(df):
     county_data = (
-        df.groupby("county_parish")
+        df.group_by("county_parish")
         .agg(
             pl.col("no_of_employees").sum().alias("total_affected"),
             pl.count().alias("num_notices")
@@ -414,7 +414,7 @@ notice_period_histogram(df)
 
 # Prepare industry data
 industry_data = (
-    df.groupby("related_industry")
+    df.group_by("related_industry")
     .agg(
         pl.col("no_of_employees").sum().alias("total_affected")
     )
