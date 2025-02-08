@@ -1,5 +1,7 @@
 requests
 pandas
+polars
+plotly
 openpyxl
 pyarrow
 great_tables
