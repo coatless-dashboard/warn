@@ -3,3 +3,4 @@ pandas
 openpyxl
 pyarrow
 great_tables
+itables
