@@ -37,8 +37,8 @@ DATA_FILE = f"warn-data/data/processed/ca/{CURRENT_YEAR}/ca-{CURRENT_YEAR}-warn-
 # Load the parquet file and calculate notice period
 df = pl.read_parquet(DATA_FILE)
 df = df.with_columns([
-    (pl.col("effective_date").cast(pl.Date) - pl.col("notice_date").cast(pl.Date))
-    .dt.days()
+    ((pl.col("effective_date").cast(pl.Date) - pl.col("notice_date").cast(pl.Date)))
+    .dt.total_days()  # Extract days from duration
     .alias("notice_period_days")
 ])
 ```
