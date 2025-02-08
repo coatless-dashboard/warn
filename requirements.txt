@@ -1,7 +1,7 @@
 requests
 pandas
 polars
-plotly
+plotly==5.24.1 # 5.24.1 seems to be more stable than 6.0.0 with Quarto dashboards
 openpyxl
 pyarrow
 great_tables
