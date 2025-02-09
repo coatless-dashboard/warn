@@ -21,15 +21,17 @@ from plotly.subplots import make_subplots
 from datetime import datetime
 import numpy as np
 from great_tables import GT, style, loc
+import re
+
+# Geographic libraries
+import folium
+from folium import plugins
+import json
 
 # Get current year for data loading
 CURRENT_YEAR = datetime.now().year
 DATA_FILE = f"warn-data/data/processed/ca/{CURRENT_YEAR}/ca-{CURRENT_YEAR}-warn-notice.parquet"
 ```
-
-# Overview {orientation="rows"}
-
-## Row
 
 ```{python}
 #| label: load-data-and-summary
@@ -43,9 +45,13 @@ df = df.with_columns([
 ])
 ```
 
+# Overview {orientation="rows"}
+
+## Row
+
 ```{python}
 #| label: monthly-trends
-#| title: "Monthly Affected Employees"
+#| title: "Monthly Affected Employees by Category"
 #| fig-height: 8
 
 def plot_category_breakdown(df):
@@ -126,7 +132,7 @@ def plot_category_breakdown(df):
     
     # Update layout
     fig.update_layout(
-        title='Monthly Affected Employees by Category',
+        #title='',
         xaxis_title='Month',
         yaxis_title='Number of Affected Employees',
         barmode='stack',
@@ -217,6 +223,7 @@ overall_table.show()
 ## Row
 
 ```{python}
+#| label: heatmap-notice-effective-dates
 #| title: Employee Impact Distribution by Notice and Effective Dates
 
 def create_notice_heatmaps_single_scale(df):
@@ -319,7 +326,282 @@ def create_notice_heatmaps_single_scale(df):
 create_notice_heatmaps_single_scale(df)
 ```
 
-# Analysis {.tabset orientation="rows"}
+# Recent Notices {orientation="rows"}
+
+```{python}
+#| label: setup-recent
+from datetime import datetime, timedelta
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from great_tables import GT
+
+# Calculate date ranges
+current_date = datetime.now().date()
+date_20_days_ago = current_date - timedelta(days=20)
+
+# Filter for recent notices
+recent_notices = df.filter(
+    (pl.col("notice_date").cast(pl.Date) >= date_20_days_ago) &
+    (pl.col("notice_date").cast(pl.Date) <= current_date)
+)
+```
+
+## Row {height="35%"}
+
+```{python}
+#| label: recent-summary
+#| title: "Recent Notice Impact Summary"
+
+# Calculate key metrics
+total_recent = recent_notices["no_of_employees"].sum()
+num_companies = recent_notices["company"].n_unique()
+num_counties = recent_notices["county_parish"].n_unique()
+avg_employees = recent_notices["no_of_employees"].mean()
+
+# Create summary table
+summary_df = pd.DataFrame([
+    ["Total Affected Employees", total_recent],
+    ["Number of Companies", num_companies],
+    ["Counties Affected", num_counties],
+    ["Average Employees per Notice", round(avg_employees, 1)]
+], columns=["Metric", "Value"])
+
+# Display formatted table
+GT(summary_df)\
+    .tab_header(title=f"Recent Notices Summary (Past 20 Days)")\
+    .fmt_number(
+        columns=["Value"],
+        decimals=0,
+        use_seps=True
+    )\
+    .show()
+```
+
+## Row {height="65%"}
+
+```{python}
+#| label: recent-notice-details
+#| title: "Recent Notices Details"
+
+# Create detailed company table
+company_details = (
+    recent_notices
+    .select([
+        "company",
+        "notice_date",
+        "effective_date",
+        "no_of_employees",
+        "layoff_closure",
+        "county_parish"
+    ])
+    .sort("notice_date", descending=True)
+    .to_pandas()
+)
+
+# Format dates
+company_details['notice_date'] = pd.to_datetime(company_details['notice_date']).dt.strftime('%Y-%m-%d')
+company_details['effective_date'] = pd.to_datetime(company_details['effective_date']).dt.strftime('%Y-%m-%d')
+
+# Define tech companies
+tech_companies = [
+    'Google', 'Alphabet', 'Meta', 'Facebook', 'Apple', 'Microsoft', 'Amazon', 
+    'Netflix', 'Salesforce', 'Adobe', 'Intel', 'Cisco', 'Oracle', 'IBM', 
+    'Twitter', 'X Corp', 'LinkedIn', 'PayPal', 'Uber', 'Lyft', 'Airbnb',
+    'Snap', 'Pinterest', 'Zoom', 'Block', 'Square', 'Stripe', 'Coinbase',
+    'Robinhood', 'DoorDash', 'Instacart', 'Unity', 'Roblox', 'Electronic Arts',
+    'AMD', 'NVIDIA', 'Tesla', 'Dell', 'HP', 'VMware', 'Workday', 'ServiceNow', 'Walmart'
+]
+
+# Function to check if a company is a tech company
+def is_tech_company(company_name):
+    if not isinstance(company_name, str):
+        return False
+    for tech in tech_companies:
+        # Create pattern with word boundaries
+        pattern = r'\b' + re.escape(tech) + r'\b'
+        if re.search(pattern, company_name, re.IGNORECASE):
+            return True
+    return False
+
+# Add a column for tech company highlighting
+company_details['is_tech'] = company_details['company'].apply(is_tech_company)
+
+# Get indices of tech companies
+tech_company_indices = company_details.index[company_details['is_tech']].tolist()
+
+# Create and format table
+gt_table = (GT(company_details)
+    .tab_header(title="Recent WARN Notices Details")
+    .cols_label(
+        company="Company",
+        notice_date="Notice Date",
+        effective_date="Effective Date",
+        no_of_employees="Affected Employees",
+        layoff_closure="Type",
+        county_parish="County"
+    )
+    .fmt_number(
+        columns=["no_of_employees"],
+        decimals=0,
+        use_seps=True
+    )
+    .tab_style(
+        style=style.text(weight="bold"),
+        locations=loc.column_labels()
+    )
+    .cols_hide(["is_tech"])
+)
+
+# Add highlighting for tech companies using indices
+if tech_company_indices:  # Only apply if there are tech companies
+    gt_table = gt_table.tab_style(
+        style=style.fill(color="rgb(173, 216, 230)"),
+        locations=loc.body(rows=tech_company_indices)
+    )
+
+gt_table.show()
+```
+
+# Active Notices {orientation="rows"}
+
+## Row {height="30%"}
+
+
+```{python}
+#| label: active-impact
+
+# Calculate 60 day window notices
+from datetime import datetime, timedelta
+current_date = datetime.now().date()
+date_60_days = current_date + timedelta(days=60)
+
+upcoming_notices = df.filter(
+    (pl.col("effective_date").cast(pl.Date) >= current_date) &
+    (pl.col("effective_date").cast(pl.Date) <= date_60_days)
+)
+
+# Create valueboxes for key metrics
+total_upcoming = upcoming_notices["no_of_employees"].sum()
+num_companies = upcoming_notices["company"].n_unique()
+avg_notice_period = upcoming_notices["notice_period_days"].mean()
+
+metrics_df = pd.DataFrame([
+    ["Total Affected Employees", total_upcoming],
+    ["Number of Companies", num_companies],
+    ["Average Notice Period (Days)", round(avg_notice_period, 1)]
+], columns=["Metric", "Value"])
+
+GT(metrics_df)\
+    .tab_header(title="60-Day Window Impact")\
+    .fmt_number(
+        columns=["Value"],
+        decimals=0,
+        use_seps=True
+    )\
+    .show()
+```
+
+
+## Row {height="40%"}
+
+```{python}
+#| label: 60-day-impact
+# Create company breakdown with additional metrics
+company_impact = (
+    upcoming_notices
+    .group_by("company")
+    .agg([
+        pl.col("no_of_employees").sum().alias("affected_employees"),
+        pl.col("layoff_closure").first().alias("type"),
+        pl.col("effective_date").first().alias("effective_date"),
+        pl.col("county_parish").first().alias("location"),
+        pl.col("processed_date").first().alias("notice_date")
+    ])
+    .with_columns([
+        (pl.col("effective_date").cast(pl.Date) - pl.lit(datetime.now().date()))
+        .dt.days()
+        .alias("days_until")
+    ])
+    .sort("days_until")
+    .head(10)
+    .select([  
+        "company",
+        "affected_employees",
+        "type",
+        "notice_date",
+        "location",
+        "effective_date",
+        "days_until"
+    ])
+    .to_pandas()  # Convert to pandas only at the end for GT
+)
+
+# Create enhanced GT table
+GT(company_impact)\
+    .tab_header(
+        title="Companies with Upcoming Layoffs",
+        subtitle="Sorted by days until effective date"
+    )\
+    .fmt_number(
+        columns=["affected_employees"],
+        decimals=0,
+        use_seps=True
+    )\
+    .fmt_date(
+        columns=["effective_date", "notice_date"],
+        date_style="month_day_year"
+    )\
+    .fmt_number(
+        columns=["days_until"],
+        decimals=0,
+        pattern="{x} days"
+    )\
+    .cols_label(
+        company="Company",
+        affected_employees="Affected\nEmployees",
+        type="Action Type",
+        notice_date="Notice\nDate",
+        location="County",
+        effective_date="Effective\nDate",
+        days_until="Time\nRemaining"
+    )\
+    .tab_source_note(
+        source_note="Data sourced from WARN notices"
+    )\
+    .cols_align(
+        align="center",
+        columns=["affected_employees", "days_until"]
+    )\
+    .tab_style(
+        style=style.fill(color="lightpink"),
+        locations=loc.body(
+            columns=["days_until"],
+            rows=lambda x: x["days_until"] <= 30
+        )
+    )\
+    .tab_style(
+        style=style.fill(color="lightblue"),
+        locations=loc.body(
+            columns=["type"],
+            rows=lambda x: x["type"] == "Closure"
+        )
+    )\
+    .show()
+```
+
+
+## Row {height="10%"}
+
+
+::: {.card}
+
+### Resources for Affected Workers
+
+Please see the [About](index.qmd#about) section for more information on WARN notices and resources for affected workers.
+
+:::
+
+# Trends {.tabset orientation="rows"}
 
 ## Row {height="50%"}
 
@@ -410,7 +692,7 @@ notice_period_histogram(df)
 
 ```{python}
 #| label: industry-analysis
-#| title: "Industry Impact Analysis"
+#| title: "Industry Impact"
 
 # Prepare industry data
 industry_data = (
@@ -494,6 +776,382 @@ company_table = (GT(company_data)
 company_table.show()
 ```
 
+
+# Geographic {orientation="rows"}
+
+```{python}
+#| label: spatial-setup
+#| include: false
+
+# Add choropleth map of California by county
+def create_county_map(df):
+    
+    # Import California county boundaries
+    with open('california-counties.geojson', 'r') as f:
+        counties = json.load(f)
+
+    # Aggregate data by county
+    county_data = (
+        df.group_by("county_parish")
+        .agg(
+            pl.col("no_of_employees").sum().alias("total_affected"),
+            pl.count().alias("num_notices"),
+            pl.col("latitude").mean().alias("lat"),
+            pl.col("longitude").mean().alias("lon")
+        )
+        .to_pandas()
+    )
+    
+    # Clean county names to match GeoJSON
+    county_data['county_parish'] = county_data['county_parish'].str.replace(' County', '')
+    
+    # Create base map centered on California
+    m = folium.Map(
+        location=[37.0902, -120.7129],
+        zoom_start=6,
+        tiles='cartodbpositron'
+    )
+    
+    # Add choropleth layer
+    folium.Choropleth(
+        geo_data=counties,
+        name='Affected Employees by County',
+        data=county_data,
+        columns=['county_parish', 'total_affected'],
+        key_on='feature.properties.name',
+        fill_color='YlOrRd',
+        fill_opacity=0.7,
+        line_opacity=0.2,
+        legend_name='Total Affected Employees',
+        highlight=True,
+        reset=True
+    ).add_to(m)
+    
+    # Create marker cluster for individual notices
+    marker_cluster = plugins.MarkerCluster(name='Individual Notices').add_to(m)
+    
+    # Add markers for each notice
+    for _, row in df.to_pandas().iterrows():
+        if pd.notna(row['latitude']) and pd.notna(row['longitude']):
+            folium.Marker(
+                location=[row['latitude'], row['longitude']],
+                popup=folium.Popup(
+                    f"<b>{row['company']}</b><br>"
+                    f"Affected Employees: {row['no_of_employees']:,}<br>"
+                    f"Notice Date: {row['notice_date']}<br>"
+                    f"Type: {row['layoff_closure']}",
+                    max_width=300
+                ),
+                icon=folium.Icon(color='red', icon='info-sign')
+            ).add_to(marker_cluster)
+    
+    # Add layer control
+    folium.LayerControl().add_to(m)
+    
+    return m
+
+def create_regional_analysis(df):
+    # Define regions based on latitude/longitude
+    def assign_region(row):
+        lat, lon = row['latitude'], row['longitude']
+        if pd.isna(lat) or pd.isna(lon):
+            return 'Unknown'
+        elif lat > 38.0:
+            return 'Northern California'
+        elif lat > 35.5:
+            return 'Central California'
+        else:
+            return 'Southern California'
+    
+    # Add region column
+    regional_data = (
+        df.with_columns([
+            pl.struct(['latitude', 'longitude'])
+            .map_elements(lambda x: assign_region(x))
+            .alias('region')
+        ])
+        .group_by(['region', 'layoff_closure'])
+        .agg([
+            pl.col('no_of_employees').sum().alias('total_affected'),
+            pl.count().alias('num_notices')
+        ])
+        .sort(['region', 'total_affected'], descending=True)
+        .to_pandas()
+    )
+    
+    # Create subplots
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=('Affected Employees by Region', 'Number of Notices by Region'),
+        specs=[[{"type": "bar"}, {"type": "bar"}]]
+    )
+    
+    # Add traces for affected employees
+    for region in regional_data['region'].unique():
+        region_data = regional_data[regional_data['region'] == region]
+        fig.add_trace(
+            go.Bar(
+                name=region,
+                x=region_data['layoff_closure'],
+                y=region_data['total_affected'],
+                text=region_data['total_affected'].apply(lambda x: f'{x:,.0f}'),
+                textposition='auto',
+            ),
+            row=1, col=1
+        )
+        
+        fig.add_trace(
+            go.Bar(
+                name=region,
+                x=region_data['layoff_closure'],
+                y=region_data['num_notices'],
+                text=region_data['num_notices'].apply(lambda x: f'{x:,.0f}'),
+                textposition='auto',
+                showlegend=False
+            ),
+            row=1, col=2
+        )
+    
+    # Update layout
+    fig.update_layout(
+        height=600,
+        barmode='group',
+        xaxis=dict(tickangle=45),
+        xaxis2=dict(tickangle=45)
+    )
+    
+    return fig
+```
+
+## Row {height="60%"}
+
+```{python}
+#| label: county-map
+#| title: "Geographic Distribution"
+create_county_map(df)
+```
+
+
+## Row {height="40%"}
+
+```{python}
+#| label: by-region
+#| title: "Regional Analysis"
+create_regional_analysis(df)
+```
+
+# Compliance {orientation="rows"}
+
+```{python}
+#| label: setup-compliance
+#| include: false
+
+def analyze_notice_compliance(df):
+    # Calculate compliance statistics
+    compliance_stats = (
+        df.with_columns([
+            (pl.col("notice_period_days") >= 60).alias("is_compliant"),
+            pl.when(pl.col("notice_period_days") >= 60)
+            .then(pl.lit("Compliant (60+ days)"))
+            .otherwise(pl.lit("Non-compliant (<60 days)"))
+            .alias("compliance_status")
+        ])
+        .group_by("compliance_status")
+        .agg([
+            pl.count().alias("num_notices"),
+            pl.col("no_of_employees").sum().alias("total_affected")
+        ])
+        .with_columns([
+            (pl.col("num_notices") / pl.col("num_notices").sum() * 100).alias("notice_percentage"),
+            (pl.col("total_affected") / pl.col("total_affected").sum() * 100).alias("affected_percentage")
+        ])
+        .sort("compliance_status")
+        .to_pandas()
+    )
+    
+    # Create figure with secondary y-axis
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    
+    # Add bar for number of notices
+    fig.add_trace(
+        go.Bar(
+            name='Number of Notices',
+            x=compliance_stats['compliance_status'],
+            y=compliance_stats['num_notices'],
+            text=compliance_stats['num_notices'].apply(lambda x: f'{x:,.0f}'),
+            textposition='auto',
+            marker_color='rgb(158,202,225)',
+            hovertemplate="Status: %{x}<br>Notices: %{y:,.0f}<extra></extra>"
+        ),
+        secondary_y=False
+    )
+    
+    # Add bar for affected employees
+    fig.add_trace(
+        go.Bar(
+            name='Affected Employees',
+            x=compliance_stats['compliance_status'],
+            y=compliance_stats['total_affected'],
+            text=compliance_stats['total_affected'].apply(lambda x: f'{x:,.0f}'),
+            textposition='auto',
+            marker_color='rgb(94,158,217)',
+            hovertemplate="Status: %{x}<br>Affected: %{y:,.0f}<extra></extra>"
+        ),
+        secondary_y=True
+    )
+    
+    # Update layout
+    fig.update_layout(
+        title="Notice Compliance Analysis",
+        barmode='group',
+        height=500,
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        )
+    )
+    
+    # Update axes labels
+    fig.update_yaxes(title_text="Number of Notices", secondary_y=False)
+    fig.update_yaxes(title_text="Number of Affected Employees", secondary_y=True)
+    
+    return fig
+
+def analyze_notice_trends(df):
+    # Calculate monthly compliance trends
+    monthly_trends = (
+        df.with_columns([
+            pl.col("notice_date").cast(pl.Date).dt.truncate("1mo").alias("month"),
+            (pl.col("notice_period_days") >= 60).alias("is_compliant")
+        ])
+        .group_by("month")
+        .agg([
+            pl.col("is_compliant").mean().alias("compliance_rate"),
+            pl.count().alias("total_notices")
+        ])
+        .sort("month")
+        .to_pandas()
+    )
+    
+    # Create figure
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    
+    # Add compliance rate line
+    fig.add_trace(
+        go.Scatter(
+            x=monthly_trends['month'],
+            y=monthly_trends['compliance_rate'] * 100,
+            name="Compliance Rate",
+            line=dict(color='blue'),
+            hovertemplate="Date: %{x}<br>Compliance Rate: %{y:.1f}%<extra></extra>"
+        ),
+        secondary_y=False
+    )
+    
+    # Add total notices bars
+    fig.add_trace(
+        go.Bar(
+            x=monthly_trends['month'],
+            y=monthly_trends['total_notices'],
+            name="Total Notices",
+            marker_color='lightgray',
+            hovertemplate="Date: %{x}<br>Total Notices: %{y:,.0f}<extra></extra>"
+        ),
+        secondary_y=True
+    )
+    
+    # Update layout
+    fig.update_layout(
+        title="Monthly Compliance Trends",
+        xaxis_title="Month",
+        height=500
+    )
+    
+    # Update y-axes labels
+    fig.update_yaxes(title_text="Compliance Rate (%)", secondary_y=False)
+    fig.update_yaxes(title_text="Total Notices", secondary_y=True)
+    
+    return fig
+
+def analyze_industry_compliance(df):
+    # Calculate compliance by industry
+    industry_compliance = (
+        df.with_columns([
+            (pl.col("notice_period_days") >= 60).alias("is_compliant")
+        ])
+        .group_by("related_industry")
+        .agg([
+            pl.col("is_compliant").mean().alias("compliance_rate"),
+            pl.count().alias("total_notices"),
+            pl.col("no_of_employees").sum().alias("total_affected")
+        ])
+        .sort("total_affected", descending=True)
+        .head(10)
+        .sort("compliance_rate", descending=True)
+        .to_pandas()
+    )
+    
+    # Create figure
+    fig = go.Figure()
+    
+    # Add bars
+    fig.add_trace(
+        go.Bar(
+            x=industry_compliance['related_industry'],
+            y=industry_compliance['compliance_rate'] * 100,
+            marker_color='lightblue',
+            text=industry_compliance['compliance_rate'].apply(lambda x: f'{x*100:.1f}%'),
+            textposition='auto',
+            hovertemplate="Industry: %{x}<br>" +
+                         "Compliance Rate: %{y:.1f}%<br>" +
+                         "Total Notices: %{customdata[0]:,.0f}<br>" +
+                         "Affected Employees: %{customdata[1]:,.0f}<extra></extra>",
+            customdata=industry_compliance[['total_notices', 'total_affected']].values
+        )
+    )
+    
+    # Update layout
+    fig.update_layout(
+        title="Industry Compliance Analysis",
+        xaxis_title="Industry",
+        yaxis_title="Compliance Rate (%)",
+        xaxis_tickangle=45,
+        height=500,
+        showlegend=False
+    )
+    
+    return fig
+```
+
+## Row {height="40%"}
+
+```{python}
+#| label: notice-period-compliance
+#| title: "Notice Period Compliance"
+analyze_notice_compliance(df)
+```
+
+## Row {height="30%"}
+
+```{python}
+#| label: monthly-compliance-trends
+#| title: "Monthly Compliance Trends"
+analyze_notice_trends(df)
+```
+
+## Row {height="30%"}
+
+```{python}
+#| label: notice-period-by-industry
+#| title: 60-Day Notice Compliance Rate by Industry (Top 10 by Volume)
+analyze_industry_compliance(df)
+```
+
+
 # Data Explorer
 
 ```{python}
@@ -513,21 +1171,6 @@ options.buttons = ['copy', 'csv', 'excel']
 show(df.to_pandas(), showIndex=False)
 ```
 
-## Row
-
-
-
-# 60 Days {height=50%}
-
-```{python}
-#| label: sixty-day-summary
-#| title: "60-Day Notice Period Statistics"
-
-# Display 60-day summary table
-sixty_day_table = create_summary_table(calculate_summary_stats(df, 60), "60-Day Notice Period Summary Statistics")
-sixty_day_table.show()
-```
-
 
 # About
 
@@ -540,6 +1183,39 @@ notice and effective dates, layoff reasons, and company details. The data is bei
 and is updated nightly.
 
 Last updated: **`{python} datetime.now().strftime('%Y-%m-%d %H:%M:%S')`**
+
+:::{.card}
+
+If you've received a WARN notice or are affected by an upcoming layoff, here are resources to help:
+
+#### Immediate Steps
+
+- File for Unemployment Insurance: Visit the [California EDD Website](https://edd.ca.gov/unemployment/)
+- Review Your Benefits: Contact your HR department about healthcare continuation (COBRA) and other benefits
+- Request Your Personnel File: California workers have the right to request their employment records
+
+#### Job Search Resources
+
+- [CalJOBS](https://www.caljobs.ca.gov/): California's job bank and career resources
+- [America's Job Center of California](https://edd.ca.gov/jobs_and_training/): Free job search and career services
+- [Rapid Response Services](https://edd.ca.gov/en/jobs_and_training/Layoff_Services_WARN/): Special programs for affected workers
+
+#### Financial & Legal Assistance
+
+- [Legal Aid at Work](https://legalaidatwork.org/): Free legal services for workers
+- [Consumer Financial Protection Bureau](https://www.consumerfinance.gov/): Financial guidance and resources
+- [California Labor Commissioner's Office](https://www.dir.ca.gov/dlse/): Information about your rights
+
+#### Additional Support
+
+- [211 California](https://www.211ca.org/): Connects to local health and social services
+- [California Career Planning Guide](https://www.cde.ca.gov/ci/ct/gi/): Career planning resources
+- Mental Health Support: Call or text 988 for 24/7 crisis support
+
+For more information about WARN notices and your rights, visit the [California EDD WARN Information Page](https://edd.ca.gov/en/jobs_and_training/Layoff_Services_WARN/).
+
+:::
+
 
 ```{python}
 #| label: data-quality
