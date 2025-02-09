@@ -1,11 +1,15 @@
 import requests
-import pandas as pd
+import polars as pl
 import os
 from datetime import datetime
 import json
 import sys
 import re
 from pathlib import Path
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderTimedOut, GeocoderServiceError
+from geopy.extra.rate_limiter import RateLimiter
+import time
 
 def get_california_warn_url():
     """Return the URL for California WARN data."""
@@ -74,53 +78,235 @@ def standardize_column_name(col_name):
     
     return col_name
 
-def process_california_warn(file_path):
+
+def clean_address(address):
     """
-    Process California WARN Excel file:
-    - Read the 'Detailed WARN Report ' worksheet
-    - Skip the first row (non-header content)
-    - Clean and standardize the data
+    Clean and standardize address string:
+    - Remove suite/unit numbers
+    - Remove extra whitespace
+    - Handle special characters
     """
-    df = pd.read_excel(
-        file_path, 
+    # Convert to string if not already
+    address = str(address)
+    
+    # Remove suite/unit numbers (e.g., "Suite #2300", "# 1100")
+    address = re.sub(r'(?i)(?:suite|ste\.?|unit|#)\s*#?\s*\d+,?\s*', '', address)
+    
+    # Remove multiple spaces
+    address = re.sub(r'\s+', ' ', address)
+    
+    # Clean up any remaining special characters
+    address = re.sub(r'[^\w\s,.-]', '', address)
+    
+    return address.strip()
+
+def setup_geocoding_cache(base_dir):
+    """
+    Set up the geocoding cache using a polars DataFrame.
+    Creates and loads cache if it exists, otherwise creates new cache.
+    """
+    cache_dir = Path(base_dir) / 'geocoding' / 'ca'
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / 'address_cache.parquet'
+    
+    if cache_file.exists():
+        try:
+            # Load existing cache
+            cache_df = pl.read_parquet(cache_file)
+            # Validate schema
+            required_columns = {
+                'address': pl.String,
+                'cleaned_address': pl.String,
+                'latitude': pl.Float64,
+                'longitude': pl.Float64,
+                'last_updated': pl.String,
+                'geocoding_source': pl.String
+            }
+            
+            # Check if all required columns exist with correct types
+            current_schema = dict(cache_df.schema)
+            if not all(col in current_schema and current_schema[col] == dtype 
+                      for col, dtype in required_columns.items()):
+                print("Cache file schema mismatch, creating new cache")
+                cache_df = pl.DataFrame(schema=required_columns)
+        except Exception as e:
+            print(f"Error reading cache file: {e}. Creating new cache.")
+            cache_df = pl.DataFrame(schema=required_columns)
+    else:
+        # Create new cache with explicit schema
+        cache_df = pl.DataFrame(schema={
+            'address': pl.String,
+            'cleaned_address': pl.String,
+            'latitude': pl.Float64,
+            'longitude': pl.Float64,
+            'last_updated': pl.String,
+            'geocoding_source': pl.String
+        })
+    
+    return cache_df, cache_file
+
+def add_to_cache(cache_df, cache_file, address, coordinates):
+    """
+    Add a new address and its coordinates to the cache.
+    Updates cache file on disk after adding.
+    """
+    clean_addr = clean_address(address)
+    
+    # Create new row
+    new_row = pl.DataFrame({
+        'address': [address],
+        'cleaned_address': [clean_addr],
+        'latitude': [coordinates[0] if coordinates else None],
+        'longitude': [coordinates[1] if coordinates else None],
+        'last_updated': [datetime.now().isoformat()],
+        'geocoding_source': ['nominatim']
+    })
+    
+    try:
+        # Load the most recent cache from file
+        current_cache = pl.read_parquet(cache_file) if cache_file.exists() else cache_df
+        
+        # Remove any existing entries for this address
+        current_cache = current_cache.filter(pl.col('cleaned_address') != clean_addr)
+        
+        # Concatenate the new row with the existing cache
+        updated_cache = pl.concat([current_cache, new_row], how="vertical")
+        
+        # Sort by last_updated to keep most recent entries first
+        updated_cache = updated_cache.sort('last_updated', descending=True)
+        
+        # Write the entire updated cache back to file
+        updated_cache.write_parquet(cache_file)
+        
+        return updated_cache
+        
+    except Exception as e:
+        print(f"Error updating cache: {e}")
+        # If there's an error, try to at least save the current cache_df
+        try:
+            cache_df.write_parquet(cache_file)
+        except Exception as write_error:
+            print(f"Error writing cache to disk: {write_error}")
+        return cache_df
+
+def get_from_cache(cache_df, address, cache_file):
+    """
+    Look up an address in the cache DataFrame.
+    Returns (latitude, longitude) tuple if found, None if not found.
+    """
+    clean_addr = clean_address(address)
+    
+    try:
+        # Attempt to read the latest cache from file
+        current_cache = pl.read_parquet(cache_file) if cache_file.exists() else cache_df
+    except Exception as e:
+        print(f"Error reading cache file: {e}, falling back to memory cache")
+        current_cache = cache_df
+    
+    result = current_cache.filter(pl.col('cleaned_address') == clean_addr)
+    
+    if result.height > 0:
+        # Get the most recent entry (should be first due to sorting)
+        row = result.row(0)
+        if row[2] is not None and row[3] is not None:  # Check lat/lon not null
+            return (row[2], row[3])
+    return None
+
+def geocode_address(address_string, cache_df, cache_file):
+    """
+    Geocode a full address string to obtain latitude and longitude.
+    Uses cache stored in polars DataFrame.
+    """
+    try:
+        # Check cache first
+        cached_result = get_from_cache(cache_df, address_string, cache_file)
+        if cached_result is not None:
+            print(f"Cache hit for address: {address_string}")
+            return cached_result
+            
+        print(f"Cache miss for address: {address_string}")
+        
+        # Initialize the geocoder with increased timeout
+        geolocator = Nominatim(
+            user_agent="warn_notice_processor",
+            timeout=5
+        )
+        
+        # Create a rate-limited version of the geocoding function
+        geocode = RateLimiter(
+            geolocator.geocode,
+            min_delay_seconds=1,
+            max_retries=2,
+            error_wait_seconds=2.0
+        )
+        
+        # Try geocoding with the cleaned address
+        location = geocode(clean_address(address_string))
+        if location:
+            result = (location.latitude, location.longitude)
+            # Update cache with new result
+            cache_df = add_to_cache(cache_df, cache_file, address_string, result)
+            return result
+            
+        # Store failed attempt in cache
+        cache_df = add_to_cache(cache_df, cache_file, address_string, None)
+        return None
+        
+    except (GeocoderTimedOut, GeocoderServiceError) as e:
+        print(f"Geocoding error for address '{address_string}': {str(e)}")
+        return None
+    except Exception as e:
+        print(f"Unexpected error geocoding address '{address_string}': {str(e)}")
+        return None
+
+def process_california_warn(file_path, base_dir):
+    """
+    Process California WARN Excel file with geocoding cache support.
+    """
+    # Set up cache
+    cache_df, cache_file = setup_geocoding_cache(base_dir)
+    
+    # Read Excel file using polars
+    df = pl.read_excel(
+        source=file_path,
         sheet_name='Detailed WARN Report ',
-        header=1  # Use second row as headers
+        engine='calamine',
+        read_options={
+            'header_row': 1,
+            'skip_rows': 0
+        }
     )
     
     # Standardize column names
-    df.columns = [standardize_column_name(col) for col in df.columns]
+    df = df.select([
+        pl.col(col).alias(standardize_column_name(col))
+        for col in df.columns
+    ])
 
     # Add state and download timestamp
-    df['state'] = 'california'
-    df['download_date'] = datetime.now().isoformat()
+    df = df.with_columns([
+        pl.lit('california').alias('state'),
+        pl.lit(datetime.now().isoformat()).alias('download_date')
+    ])
+    
+    # Geocode addresses
+    addresses = df.select(['address']).to_series().to_list()
+    print(f"Geocoding {len(addresses)} addresses...")
+    
+    # Process addresses with progress indicator
+    coordinates = []
+    for i, addr in enumerate(addresses, 1):
+        print(f"Processing address {i}/{len(addresses)}: {addr}")
+        coord = geocode_address(addr, cache_df, cache_file)
+        coordinates.append(coord)
+    
+    # Add latitude and longitude columns
+    df = df.with_columns([
+        pl.Series('latitude', [coord[0] if coord else None for coord in coordinates]),
+        pl.Series('longitude', [coord[1] if coord else None for coord in coordinates])
+    ])
     
     return df
-
-def save_processed_files(df, processed_dir, year):
-    """
-    Save DataFrame in both CSV and Parquet formats.
-    Returns a dictionary with file information.
-    """
-    file_info = {}
-    base_name = f'ca-{year}-warn-notice'
-    
-    # Save as CSV
-    csv_path = os.path.join(processed_dir, f'{base_name}.csv')
-    df.to_csv(csv_path, index=False)
-    file_info['csv'] = {
-        'path': csv_path,
-        'size_bytes': os.path.getsize(csv_path)
-    }
-    
-    # Save as Parquet
-    parquet_path = os.path.join(processed_dir, f'{base_name}.parquet')
-    df.to_parquet(parquet_path, index=False)
-    file_info['parquet'] = {
-        'path': parquet_path,
-        'size_bytes': os.path.getsize(parquet_path)
-    }
-    
-    return file_info
 
 def main():
     # Get base directory from command line argument
@@ -148,7 +334,7 @@ def main():
         
         # Process the file
         print("Processing California WARN data...")
-        df = process_california_warn(download_path)
+        df = process_california_warn(download_path, base_dir)
         
         # Save processed files
         print("Saving processed data...")
@@ -157,24 +343,18 @@ def main():
         metadata['states_processed'].append({
             'state': 'california',
             'status': 'success',
-            'records': len(df),
+            'records': df.height,
             'source_url': url,
-            'columns': df.columns.tolist(),
+            'columns': df.columns,
             'files': {
                 'download': {
-                    'path': download_path,
+                    'path': str(download_path),
                     'size_bytes': os.path.getsize(download_path)
                 },
                 'processed': file_info
             },
             'timestamp': datetime.now().isoformat()
         })
-        
-        print(f"Successfully processed California WARN data:")
-        print(f"- {len(df)} records")
-        print(f"- Download path: {download_path}")
-        print(f"- CSV path: {file_info['csv']['path']}")
-        print(f"- Parquet path: {file_info['parquet']['path']}")
         
     except Exception as e:
         print(f"Error processing California WARN data: {str(e)}")
@@ -185,7 +365,7 @@ def main():
             'source_url': url
         })
     
-    # Save metadata in the base directory
+    # Save metadata
     metadata_path = os.path.join(base_dir, 'metadata.json')
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2)
