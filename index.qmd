@@ -519,7 +519,7 @@ company_impact = (
     ])
     .with_columns([
         (pl.col("effective_date").cast(pl.Date) - pl.lit(datetime.now().date()))
-        .dt.days()
+        .dt.total_days()
         .alias("days_until")
     ])
     .sort("days_until")
