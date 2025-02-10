@@ -5,6 +5,7 @@ plotly==5.24.1 # 5.24.1 seems to be more stable than 6.0.0 with Quarto dashboard
 fastexcel    # For Excel files
 geopy        # For geocoding
 usaddress    # For address parsing
+folium       # For maps
 pyarrow      # For parquet files
 great_tables # Static styled tables
 itables      # Interactive tables
